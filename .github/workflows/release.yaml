@@ -1,0 +1,130 @@
+---
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Cargo profile (release | dev)'
+        required: false
+        default: 'release'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    env:
+      PROFILE: ${{ github.event.inputs.profile || 'release' }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: >- # v4.2.2
+          actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Refusing to release."
+            exit 1
+          fi
+
+      - name: Set up Rust toolchain
+        shell: bash
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Rust cache
+        # https://github.com/Swatinem/rust-cache/releases/tag/v2.8.1
+        uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          key: ${{ env.TARGET }}-${{ env.PROFILE }}
+
+      - name: Build recon
+        run: cargo build --bin recon --profile "$PROFILE" --target "$TARGET"
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PROFILE" in
+            release) out_dir="target/$TARGET/release" ;;
+            dev)     out_dir="target/$TARGET/debug" ;;
+            *)       out_dir="target/$TARGET/$PROFILE" ;;
+          esac
+          bin="$out_dir/recon"
+          test -x "$bin"
+          if [[ "$TARGET" == *-apple-darwin ]]; then
+            codesign -s - -f "$bin"
+          fi
+          archive="recon-$TARGET.tar.gz"
+          staging="$(mktemp -d)"
+          cp "$bin" "$staging/recon"
+          tar -czf "$archive" -C "$staging" recon
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        # https://github.com/actions/upload-artifact/releases/tag/v4.4.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: recon-${{ matrix.target }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              "${{ steps.stage.outputs.archive }}" \
+              "${{ steps.stage.outputs.checksum }}" \
+              --clobber
+          else
+            gh release create "$tag" \
+              --title "recon $tag" \
+              --generate-notes \
+              "${{ steps.stage.outputs.archive }}" \
+              "${{ steps.stage.outputs.checksum }}"
+          fi
