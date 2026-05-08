@@ -40,7 +40,6 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
         Cell::from(" # "),
         Cell::from("Session"),
         Cell::from("Project"),
-        Cell::from("Directory"),
         Cell::from("Status"),
         Cell::from("Model"),
         Cell::from("Context"),
@@ -88,8 +87,6 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
                 .map(format_timestamp)
                 .unwrap_or_else(|| "—".to_string());
 
-            let cwd_display = shorten_home(&session.cwd);
-
             // Project: repo::relative_dir::branch
             let project_cell = {
                 let mut spans = vec![Span::raw(&session.project_name)];
@@ -113,15 +110,10 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]));
 
-            // Directory: dimmed
-            let dir_cell =
-                Cell::from(cwd_display).style(Style::default().fg(Color::DarkGray));
-
             let row = Row::new(vec![
                 Cell::from(num),
                 Cell::from(tmux_name.to_string()),
                 project_cell,
-                dir_cell,
                 status_cell,
                 Cell::from(session.model_display()),
                 Cell::from(session.token_display()).style(token_style),
@@ -142,7 +134,6 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(4),   // #
         Constraint::Length(16),  // Session
         Constraint::Min(20),    // Project (repo + branch)
-        Constraint::Length(20), // Directory
         Constraint::Length(10), // Status
         Constraint::Length(20), // Model
         Constraint::Length(14), // Context
@@ -210,17 +201,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let footer = Paragraph::new(Line::from(spans));
     frame.render_widget(footer, area);
-}
-
-/// Replace home directory prefix with ~.
-fn shorten_home(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_string()
 }
 
 /// Format an ISO timestamp into a relative or short time string.
