@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Keep showing Working for this long after the last positive detection,
+/// to absorb the brief gaps in pane content while Claude re-renders.
+const WORKING_HOLD: Duration = Duration::from_secs(3);
 
 use serde::Deserialize;
 
@@ -108,6 +112,9 @@ pub struct Session {
     pub jsonl_path: PathBuf,
     pub last_file_size: u64,
     pub tags: HashMap<String, String>,
+    /// Most recent moment we observed the pane in a Working state.
+    /// Used to debounce Working → Idle transitions. None for never-worked.
+    pub last_working_at: Option<Instant>,
 }
 
 impl Session {
@@ -270,12 +277,14 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 .unwrap_or_else(|| decode_project_path(&project_dir));
             let (project_name, relative_dir, branch) = git_project_info(&cwd);
 
-            let status = determine_status(
+            let raw_status = determine_status(
                 &path,
                 info.input_tokens,
                 info.output_tokens,
                 Some(&live.pane_target),
             );
+            let prev_working_at = prev.and_then(|s| s.last_working_at);
+            let (status, last_working_at) = apply_working_hold(raw_status, prev_working_at);
 
             matched_session_ids.insert(session_id.clone());
 
@@ -299,6 +308,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 jsonl_path: path,
                 last_file_size: info.file_size,
                 tags,
+                last_working_at,
             });
         }
     }
@@ -367,12 +377,14 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
             let cwd = info.cwd.clone().unwrap_or_else(|| live.pane_cwd.clone());
             let (project_name, relative_dir, branch) = git_project_info(&cwd);
 
-            let status = determine_status(
+            let raw_status = determine_status(
                 &path,
                 info.input_tokens,
                 info.output_tokens,
                 Some(&live.pane_target),
             );
+            let prev_working_at = prev.and_then(|s| s.last_working_at);
+            let (status, last_working_at) = apply_working_hold(raw_status, prev_working_at);
 
             let tags = read_tmux_tags(&live.tmux_session);
             sessions.push(Session {
@@ -394,6 +406,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 jsonl_path: path,
                 last_file_size: info.file_size,
                 tags,
+                last_working_at,
             });
         } else {
             // No JSONL found — brand-new session, show as New placeholder
@@ -418,6 +431,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 jsonl_path: PathBuf::new(),
                 last_file_size: 0,
                 tags,
+                last_working_at: None,
             });
         }
     }
@@ -501,7 +515,6 @@ struct ParsedInfo {
 }
 
 use std::sync::Mutex;
-use std::time::Instant;
 
 struct GitInfo {
     repo_name: String,
@@ -1015,6 +1028,28 @@ pub fn find_session_cwd(session_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Debounce Working → Idle transitions. If the freshly-detected status is
+/// Idle but we observed Working within `WORKING_HOLD`, keep reporting Working
+/// to absorb brief gaps in pane content while Claude re-renders. Returns the
+/// effective status and the updated `last_working_at` timestamp to persist.
+fn apply_working_hold(
+    raw: SessionStatus,
+    prev_working_at: Option<Instant>,
+) -> (SessionStatus, Option<Instant>) {
+    match raw {
+        SessionStatus::Working => (SessionStatus::Working, Some(Instant::now())),
+        SessionStatus::Idle => {
+            if let Some(ts) = prev_working_at {
+                if ts.elapsed() < WORKING_HOLD {
+                    return (SessionStatus::Working, prev_working_at);
+                }
+            }
+            (SessionStatus::Idle, prev_working_at)
+        }
+        other => (other, prev_working_at),
+    }
 }
 
 /// Determine session status from file recency and token counts.
