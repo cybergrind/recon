@@ -160,10 +160,37 @@ fn which_claude() -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
-/// Kill a tmux session by name.
-pub fn kill_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["kill-session", "-t", name])
+/// Gracefully shut down a Claude process. Sends SIGTERM, waits up to ~3s for
+/// it to exit, and escalates to SIGKILL if it's still alive. Runs on a
+/// background thread so the UI doesn't block on the wait.
+///
+/// Only the Claude process itself is killed — the surrounding tmux pane and
+/// session are left intact.
+pub fn kill_claude_process(pid: i32) {
+    std::thread::spawn(move || {
+        let pid_str = pid.to_string();
+
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .output();
+
+        // Poll up to ~3s for the process to exit.
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !process_alive(&pid_str) {
+                return;
+            }
+        }
+
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid_str])
+            .output();
+    });
+}
+
+fn process_alive(pid_str: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid_str])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

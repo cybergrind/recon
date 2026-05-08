@@ -191,12 +191,11 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(real_idx) = self.resolve_selected() {
-                    let to_kill = self.sessions
-                        .get(real_idx)
-                        .and_then(|s| s.tmux_session.clone());
-                    if let Some(name) = to_kill {
-                        tmux::kill_session(&name);
-                        self.sessions.retain(|s| s.tmux_session.as_deref() != Some(name.as_str()));
+                    let target = self.sessions.get(real_idx)
+                        .and_then(|s| s.pid.map(|pid| (pid, s.session_id.clone())));
+                    if let Some((pid, session_id)) = target {
+                        tmux::kill_claude_process(pid);
+                        self.sessions.retain(|s| s.session_id != session_id);
                         self.clamp_selection();
                         self.request_refresh();
                     }
@@ -229,9 +228,10 @@ impl App {
                 }
                 KeyCode::Char('x') => {
                     if let Some(session) = self.selected_zoomed_session() {
-                        if let Some(name) = session.tmux_session.clone() {
-                            tmux::kill_session(&name);
-                            self.sessions.retain(|s| s.tmux_session.as_deref() != Some(name.as_str()));
+                        if let Some(pid) = session.pid {
+                            let session_id = session.session_id.clone();
+                            tmux::kill_claude_process(pid);
+                            self.sessions.retain(|s| s.session_id != session_id);
                             self.clamp_selection();
                             self.request_refresh();
                         }
