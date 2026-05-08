@@ -9,8 +9,11 @@ mod tmux;
 mod ui;
 mod view_ui;
 
+use std::collections::HashMap;
 use std::io;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
@@ -21,8 +24,9 @@ use crossterm::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::{App, ViewMode};
+use app::{App, RefreshHandle, ViewMode};
 use cli::{Cli, Command};
+use session::Session;
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
@@ -134,15 +138,77 @@ fn run_tui(start_mode: ViewMode) -> io::Result<()> {
     Ok(())
 }
 
+/// Spawn a background thread that runs `discover_sessions` on a 2-second cadence
+/// (or sooner when woken). The thread owns `prev_sessions` so the main thread
+/// never has to touch any subprocess work.
+fn spawn_refresh_worker() -> (mpsc::Receiver<Vec<Session>>, RefreshHandle) {
+    let (tx_data, rx_data) = mpsc::channel::<Vec<Session>>();
+    let (tx_wake, rx_wake) = mpsc::channel::<()>();
+
+    thread::spawn(move || {
+        let mut prev: HashMap<String, Session> = HashMap::new();
+        loop {
+            let sessions: Vec<Session> = session::discover_sessions(&prev)
+                .into_iter()
+                .filter(|s| s.tmux_session.is_some())
+                .collect();
+
+            prev = sessions
+                .iter()
+                .map(|s| (s.session_id.clone(), s.clone()))
+                .collect();
+
+            if tx_data.send(sessions).is_err() {
+                return; // main thread dropped the receiver
+            }
+
+            match rx_wake.recv_timeout(Duration::from_secs(2)) {
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            // Coalesce burst wakes (e.g. multiple `x` presses).
+            while rx_wake.try_recv().is_ok() {}
+        }
+    });
+
+    (rx_data, RefreshHandle { wake: tx_wake })
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, start_mode: ViewMode) -> io::Result<()> {
+    let (rx_data, handle) = spawn_refresh_worker();
+
     let mut app = App::new();
     app.view_mode = start_mode;
-    app.refresh();
+    app.set_refresh_handle(handle);
 
-    let refresh_interval = Duration::from_secs(2);
-    let mut last_refresh = Instant::now();
+    // Block briefly for the first snapshot so we don't paint an empty UI.
+    if let Ok(initial) = rx_data.recv_timeout(Duration::from_secs(5)) {
+        app.ingest_sessions(initial);
+    }
+
+    let tick_interval = Duration::from_millis(200);
 
     loop {
+        // Drain pending input first so key repeat collapses into a single draw.
+        while event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                app.handle_key(key);
+            }
+        }
+
+        if app.should_quit {
+            return Ok(());
+        }
+
+        // Pull the latest snapshot the worker has produced, discarding stale ones.
+        let mut latest: Option<Vec<Session>> = None;
+        while let Ok(sessions) = rx_data.try_recv() {
+            latest = Some(sessions);
+        }
+        if let Some(sessions) = latest {
+            app.ingest_sessions(sessions);
+        }
+
         if app.view_mode == ViewMode::View {
             view_ui::resolve_zoom(&mut app);
         }
@@ -155,19 +221,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, start_mode: Vi
 
         app.advance_tick();
 
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
-            }
-        }
-
-        if app.should_quit {
-            return Ok(());
-        }
-
-        if last_refresh.elapsed() >= refresh_interval {
-            app.refresh();
-            last_refresh = Instant::now();
-        }
+        event::poll(tick_interval)?;
     }
 }

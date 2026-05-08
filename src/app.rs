@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -9,6 +10,11 @@ use crate::tmux;
 pub enum ViewMode {
     Table,
     View,
+}
+
+/// Handle the App uses to request the background refresh worker run again.
+pub struct RefreshHandle {
+    pub wake: Sender<()>,
 }
 
 pub struct App {
@@ -25,6 +31,7 @@ pub struct App {
     pub filter_text: String,              // current search query
     pub filter_cursor: usize,             // cursor position in query
     prev_sessions: HashMap<String, Session>,
+    refresh_handle: Option<RefreshHandle>,
 }
 
 impl App {
@@ -43,9 +50,22 @@ impl App {
             filter_text: String::new(),
             filter_cursor: 0,
             prev_sessions: HashMap::new(),
+            refresh_handle: None,
         }
     }
 
+    pub fn set_refresh_handle(&mut self, handle: RefreshHandle) {
+        self.refresh_handle = Some(handle);
+    }
+
+    fn request_refresh(&self) {
+        if let Some(h) = &self.refresh_handle {
+            let _ = h.wake.send(());
+        }
+    }
+
+    /// Synchronous refresh — used by one-shot CLI commands (Next, Json).
+    /// The TUI uses `ingest_sessions` driven by the background worker instead.
     pub fn refresh(&mut self) {
         let sessions: Vec<Session> = session::discover_sessions(&self.prev_sessions)
             .into_iter()
@@ -57,14 +77,14 @@ impl App {
             .map(|s| (s.session_id.clone(), s.clone()))
             .collect();
 
-        self.sessions = sessions;
+        self.ingest_sessions(sessions);
+    }
 
-        let count = self.filtered_indices().len();
-        if count == 0 {
-            self.selected = 0;
-        } else if self.selected >= count {
-            self.selected = count - 1;
-        }
+    /// Replace the session list with a precomputed snapshot (from the worker)
+    /// and clamp the selection to the new filtered count.
+    pub fn ingest_sessions(&mut self, sessions: Vec<Session>) {
+        self.sessions = sessions;
+        self.clamp_selection();
     }
 
     pub fn advance_tick(&mut self) {
@@ -171,11 +191,14 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(real_idx) = self.resolve_selected() {
-                    if let Some(session) = self.sessions.get(real_idx) {
-                        if let Some(name) = &session.tmux_session {
-                            tmux::kill_session(name);
-                            self.refresh();
-                        }
+                    let to_kill = self.sessions
+                        .get(real_idx)
+                        .and_then(|s| s.tmux_session.clone());
+                    if let Some(name) = to_kill {
+                        tmux::kill_session(&name);
+                        self.sessions.retain(|s| s.tmux_session.as_deref() != Some(name.as_str()));
+                        self.clamp_selection();
+                        self.request_refresh();
                     }
                 }
             }
@@ -208,7 +231,9 @@ impl App {
                     if let Some(session) = self.selected_zoomed_session() {
                         if let Some(name) = session.tmux_session.clone() {
                             tmux::kill_session(&name);
-                            self.refresh();
+                            self.sessions.retain(|s| s.tmux_session.as_deref() != Some(name.as_str()));
+                            self.clamp_selection();
+                            self.request_refresh();
                         }
                     }
                     return;
