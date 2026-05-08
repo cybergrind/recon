@@ -127,6 +127,13 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Ctrl-C always quits, regardless of mode.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c'))
+        {
+            self.should_quit = true;
+            return;
+        }
         if self.filter_active {
             self.handle_key_filter(key);
             return;
