@@ -1058,6 +1058,10 @@ fn pane_status(pane_target: &str) -> SessionStatus {
 
     let content = String::from_utf8_lossy(&output.stdout);
 
+    // Scan the entire visible pane. The previous bottom-only scan flickered
+    // between Working and Idle because the spinner line drifts up as Claude
+    // renders todo lists, tool output, etc. Pane content is bounded by the
+    // pane height (typically <100 lines) so cost is negligible.
     let mut lines_checked = 0;
     for line in content.lines().rev() {
         let trimmed = line.trim();
@@ -1087,9 +1091,6 @@ fn pane_status(pane_target: &str) -> SessionStatus {
         }
 
         lines_checked += 1;
-        if lines_checked >= 10 {
-            break;
-        }
     }
 
     SessionStatus::Idle
