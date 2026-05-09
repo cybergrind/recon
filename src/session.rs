@@ -971,16 +971,29 @@ fn find_recent_jsonl_in_cwd(
     cwd: &str,
     claimed: &std::collections::HashSet<String>,
 ) -> Option<PathBuf> {
-    const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-
     let encoded = cwd.replace('/', "-");
     let project_dir = dirs::home_dir()?.join(".claude").join("projects").join(&encoded);
+    find_recent_jsonl_in_project_dir(&project_dir, claimed, JSONL_FALLBACK_MAX_AGE)
+}
+
+/// Maximum mtime age for a JSONL to count as "the active session" when no
+/// {PID}.json file is available to disambiguate.
+const JSONL_FALLBACK_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Pure version of `find_recent_jsonl_in_cwd` over an already-resolved project
+/// dir. Split out so it can be unit-tested against a tempdir without touching
+/// the real ~/.claude tree.
+fn find_recent_jsonl_in_project_dir(
+    project_dir: &Path,
+    claimed: &std::collections::HashSet<String>,
+    max_age: Duration,
+) -> Option<PathBuf> {
     if !project_dir.is_dir() {
         return None;
     }
 
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
+    for entry in fs::read_dir(project_dir).ok()?.flatten() {
         let path = entry.path();
         if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
             continue;
@@ -996,7 +1009,7 @@ fn find_recent_jsonl_in_cwd(
             Ok(t) => t,
             Err(_) => continue,
         };
-        if mtime.elapsed().map(|e| e > MAX_AGE).unwrap_or(true) {
+        if mtime.elapsed().map(|e| e > max_age).unwrap_or(true) {
             continue;
         }
         if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
@@ -1142,8 +1155,12 @@ fn pane_status(pane_target: &str) -> SessionStatus {
         _ => return SessionStatus::Idle,
     };
 
-    let content = String::from_utf8_lossy(&output.stdout);
+    pane_status_from_content(&String::from_utf8_lossy(&output.stdout))
+}
 
+/// Detect status from captured pane content. Split out from `pane_status`
+/// so it can be unit-tested without spawning tmux.
+fn pane_status_from_content(content: &str) -> SessionStatus {
     // Scan the entire visible pane. The previous bottom-only scan flickered
     // between Working and Idle because the spinner line drifts up as Claude
     // renders todo lists, tool output, etc. Pane content is bounded by the
@@ -1450,6 +1467,190 @@ mod tests {
     #[test]
     fn validate_cwd_accepts_real_dir() {
         assert!(validate_cwd("/tmp"));
+    }
+
+    // --- apply_working_hold (commit e486b7e) ---
+
+    #[test]
+    fn working_hold_passes_working_through() {
+        let (s, ts) = apply_working_hold(SessionStatus::Working, None);
+        assert_eq!(s, SessionStatus::Working);
+        assert!(ts.is_some(), "Working should stamp last_working_at");
+    }
+
+    #[test]
+    fn working_hold_holds_recent_working() {
+        // Idle observation immediately after Working — should be reported as Working.
+        let (s, _) = apply_working_hold(SessionStatus::Idle, Some(Instant::now()));
+        assert_eq!(s, SessionStatus::Working);
+    }
+
+    #[test]
+    fn working_hold_releases_after_window() {
+        let stale = Instant::now() - (WORKING_HOLD + Duration::from_secs(1));
+        let (s, ts) = apply_working_hold(SessionStatus::Idle, Some(stale));
+        assert_eq!(s, SessionStatus::Idle);
+        assert_eq!(ts, Some(stale), "stale stamp is preserved, not cleared");
+    }
+
+    #[test]
+    fn working_hold_idle_with_no_history_is_idle() {
+        let (s, ts) = apply_working_hold(SessionStatus::Idle, None);
+        assert_eq!(s, SessionStatus::Idle);
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn working_hold_passes_other_statuses_unchanged() {
+        let stamp = Some(Instant::now());
+        let (s, ts) = apply_working_hold(SessionStatus::Input, stamp);
+        assert_eq!(s, SessionStatus::Input);
+        assert_eq!(ts, stamp, "non-Working/Idle inputs do not touch the stamp");
+
+        let (s, _) = apply_working_hold(SessionStatus::New, None);
+        assert_eq!(s, SessionStatus::New);
+    }
+
+    // --- pane_status_from_content (commit 420d2a0) ---
+
+    #[test]
+    fn pane_status_detects_spinner_far_above_bottom() {
+        // Regression for commit 420d2a0: the old code bailed after 10 non-empty
+        // lines from the bottom, so a spinner above that boundary was missed.
+        // Build a pane where the spinner sits ~20 lines above the prompt.
+        let mut lines = vec!["\u{273D} Thinking\u{2026}".to_string()]; // ✽ Thinking…
+        for i in 0..20 {
+            lines.push(format!("  todo item {i}"));
+        }
+        lines.push("> _".to_string());
+        let content = lines.join("\n");
+        assert_eq!(pane_status_from_content(&content), SessionStatus::Working);
+    }
+
+    #[test]
+    fn pane_status_input_when_esc_to_cancel_on_last_line() {
+        let content = "\
+\u{273D} Thinking\u{2026}
+some output
+Press Esc to cancel
+";
+        assert_eq!(pane_status_from_content(content), SessionStatus::Input);
+    }
+
+    #[test]
+    fn pane_status_input_for_numeric_selection_prompt() {
+        let content = "\
+Choose an option:
+\u{276F} 1. Yes
+  2. No
+";
+        assert_eq!(pane_status_from_content(content), SessionStatus::Input);
+    }
+
+    #[test]
+    fn pane_status_idle_for_plain_text() {
+        let content = "\
+$ ls
+foo.txt
+bar.txt
+$
+";
+        assert_eq!(pane_status_from_content(content), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn pane_status_spinner_without_ellipsis_is_idle() {
+        // Spinner glyph alone shouldn't trip Working — must contain U+2026.
+        let content = "\u{273D} done\n";
+        assert_eq!(pane_status_from_content(content), SessionStatus::Idle);
+    }
+
+    // --- find_recent_jsonl_in_project_dir (commit a91d9b6) ---
+
+    fn make_temp_project_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "recon-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_jsonl(dir: &Path, stem: &str, age: Duration) -> PathBuf {
+        let path = dir.join(format!("{stem}.jsonl"));
+        std::fs::write(&path, b"{}\n").unwrap();
+        // Roll mtime back by `age` so the test isn't sensitive to wall-clock.
+        let target = std::time::SystemTime::now() - age;
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(target)).unwrap();
+        path
+    }
+
+    #[test]
+    fn jsonl_lookup_picks_most_recent() {
+        let dir = make_temp_project_dir();
+        write_jsonl(&dir, "old", Duration::from_secs(60 * 60)); // 1h ago
+        let recent = write_jsonl(&dir, "new", Duration::from_secs(30)); // 30s ago
+
+        let claimed = std::collections::HashSet::new();
+        let got = find_recent_jsonl_in_project_dir(&dir, &claimed, JSONL_FALLBACK_MAX_AGE);
+        assert_eq!(got.as_deref(), Some(recent.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_lookup_skips_claimed() {
+        let dir = make_temp_project_dir();
+        write_jsonl(&dir, "claimed", Duration::from_secs(30));
+        let alt = write_jsonl(&dir, "free", Duration::from_secs(60));
+
+        let mut claimed = std::collections::HashSet::new();
+        claimed.insert("claimed".to_string());
+        let got = find_recent_jsonl_in_project_dir(&dir, &claimed, JSONL_FALLBACK_MAX_AGE);
+        assert_eq!(got.as_deref(), Some(alt.as_path()),
+            "claimed JSONL must be skipped even when it's the most recent");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_lookup_filters_by_max_age() {
+        let dir = make_temp_project_dir();
+        write_jsonl(&dir, "ancient", Duration::from_secs(48 * 60 * 60)); // 2 days
+
+        let claimed = std::collections::HashSet::new();
+        let got = find_recent_jsonl_in_project_dir(&dir, &claimed, JSONL_FALLBACK_MAX_AGE);
+        assert!(got.is_none(),
+            "JSONLs older than max_age must not be returned — abandoned sessions \
+             in the same project dir would otherwise be mis-linked to a new claude");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_lookup_returns_none_for_missing_dir() {
+        let claimed = std::collections::HashSet::new();
+        let got = find_recent_jsonl_in_project_dir(
+            Path::new("/nonexistent/recon/test/dir"),
+            &claimed,
+            JSONL_FALLBACK_MAX_AGE,
+        );
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn jsonl_lookup_ignores_non_jsonl_files() {
+        let dir = make_temp_project_dir();
+        std::fs::write(dir.join("notes.txt"), b"not a session").unwrap();
+        std::fs::write(dir.join("README"), b"...").unwrap();
+        let real = write_jsonl(&dir, "real", Duration::from_secs(10));
+
+        let claimed = std::collections::HashSet::new();
+        let got = find_recent_jsonl_in_project_dir(&dir, &claimed, JSONL_FALLBACK_MAX_AGE);
+        assert_eq!(got.as_deref(), Some(real.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

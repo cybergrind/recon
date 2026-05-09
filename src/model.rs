@@ -50,3 +50,43 @@ pub fn format_with_effort(model_id: &str, effort: &str) -> String {
         format!("{name} ({effort})")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for commit eb91349: Opus 4.7 was missing from the model
+    // table, so token_ratio fell back to the default 200k window and showed
+    // 5x the real usage.
+    #[test]
+    fn opus_4_7_has_one_million_context() {
+        assert_eq!(context_window("claude-opus-4-7"), 1_000_000);
+    }
+
+    #[test]
+    fn opus_4_6_has_one_million_context() {
+        assert_eq!(context_window("claude-opus-4-6"), 1_000_000);
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_200k() {
+        assert_eq!(context_window("claude-something-unknown"), 200_000);
+    }
+
+    #[test]
+    fn opus_4_7_round_trips_through_display_lookup() {
+        let id = "claude-opus-4-7";
+        let display = display_name(id);
+        assert_eq!(display, "Opus 4.7");
+        // /model output may include the "(1M context)" suffix
+        assert_eq!(id_from_display_name(display), Some(id));
+        assert_eq!(id_from_display_name("Opus 4.7 (1M context)"), Some(id));
+    }
+
+    #[test]
+    fn format_with_effort_drops_default_marker() {
+        assert_eq!(format_with_effort("claude-opus-4-7", ""), "Opus 4.7");
+        assert_eq!(format_with_effort("claude-opus-4-7", "default"), "Opus 4.7");
+        assert_eq!(format_with_effort("claude-opus-4-7", "max"), "Opus 4.7 (max)");
+    }
+}

@@ -299,6 +299,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d5b2eef6fafbf69f877e55509ce5b11a760690ac9700a2921be067aa6afaef6"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,6 +603,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "filetime",
  "ratatui",
  "serde",
  "serde_json",
