@@ -343,15 +343,20 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
         // JSONL is stale. We detect this: if the resumed JSONL's session-id matches
         // the session_id_key (from {PID}.json), the resume is current; otherwise
         // /reset happened and we skip the stale resume path.
-        let jsonl_path = if !session_id_key.starts_with("tmux-") {
-            let cached = prev_sessions
-                .get(session_id_key.as_str())
-                .filter(|s| !s.jsonl_path.as_os_str().is_empty())
-                .map(|s| s.jsonl_path.clone());
-            cached.or_else(|| find_jsonl_for_resumed_session(&live.tmux_session, live.pid))
-        } else {
-            None
-        };
+        let cached_path = prev_sessions
+            .get(session_id_key.as_str())
+            .filter(|s| !s.jsonl_path.as_os_str().is_empty())
+            .map(|s| s.jsonl_path.clone());
+        let jsonl_path = cached_path.or_else(|| {
+            if !session_id_key.starts_with("tmux-") {
+                find_jsonl_for_resumed_session(&live.tmux_session, live.pid)
+            } else {
+                // No {PID}.json file (older claude version, or it got cleaned up).
+                // Fall back to most-recently-modified unclaimed JSONL in the
+                // pane's project dir — that's almost certainly the active session.
+                find_recent_jsonl_in_cwd(&live.pane_cwd, &matched_session_ids)
+            }
+        });
 
         let resolved_path = jsonl_path;
 
@@ -955,6 +960,52 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
+/// Find the most-recently-modified JSONL in the project dir for `cwd`, skipping
+/// any whose session-id is already claimed by another live session. Used when a
+/// claude pane has no {PID}.json file — the JSONL the process is currently
+/// writing to is almost always the most recent one in that project dir.
+///
+/// Bounded to the last 24h of activity so we don't latch onto a long-abandoned
+/// session that happens to live in the same directory.
+fn find_recent_jsonl_in_cwd(
+    cwd: &str,
+    claimed: &std::collections::HashSet<String>,
+) -> Option<PathBuf> {
+    const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+    let encoded = cwd.replace('/', "-");
+    let project_dir = dirs::home_dir()?.join(".claude").join("projects").join(&encoded);
+    if !project_dir.is_dir() {
+        return None;
+    }
+
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+            continue;
+        }
+        let stem = match path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if claimed.contains(&stem) {
+            continue;
+        }
+        let mtime = match path.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if mtime.elapsed().map(|e| e > MAX_AGE).unwrap_or(true) {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
 /// Find the JSONL file for a given session-id by scanning all project directories.
 fn find_jsonl_by_session_id(session_id: &str) -> Option<PathBuf> {
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
@@ -1265,18 +1316,43 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
     results
 }
 
-/// Check if a shell process has a claude child by looking for a child PID
-/// that has a corresponding ~/.claude/sessions/{PID}.json file.
+/// Find the claude child PID of a shell process. Prefers a child with a
+/// ~/.claude/sessions/{PID}.json file (that gives us session_id + startedAt),
+/// but falls back to any child whose command name is "claude" — older claude
+/// versions don't write session files, and sessions whose file got cleaned up
+/// would otherwise vanish from the dashboard.
 fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
     let sessions_dir = dirs::home_dir()?.join(".claude").join("sessions");
     let output = std::process::Command::new("pgrep")
         .args(["-P", &parent_pid.to_string()])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout)
+    let child_pids: Vec<i32> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|l| l.trim().parse::<i32>().ok())
+        .collect();
+
+    if let Some(pid) = child_pids
+        .iter()
         .find(|pid| sessions_dir.join(format!("{pid}.json")).exists())
+    {
+        return Some(*pid);
+    }
+
+    child_pids.into_iter().find(|pid| is_claude_process(*pid))
+}
+
+/// Check if a process's command name looks like a claude binary.
+fn is_claude_process(pid: i32) -> bool {
+    let output = match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    cmd == "claude" || cmd == "claude.exe" || cmd == "node"
 }
 
 #[cfg(test)]
